@@ -1397,6 +1397,7 @@ static bool handle_client_work(PgSocket *client, PktHdr *pkt)
 	PreparedStatementAction ps_action = PS_IGNORE;
 	PgClosePacket close_packet;
 	int log_query = false;
+	int log_parse = false;
 	const char *query;
 
 	switch (pkt->type) {
@@ -1439,6 +1440,8 @@ static bool handle_client_work(PgSocket *client, PktHdr *pkt)
 			ps_action = inspect_parse_packet(client, pkt);
 			pkt_rewind_v3(pkt);
 		}
+		if (cf_log_queries)
+			log_parse = true;
 		break;
 
 	case PqMsg_Execute:
@@ -1597,6 +1600,20 @@ static bool handle_client_work(PgSocket *client, PktHdr *pkt)
 		switch (pkt->type)
 		{
 		case PqMsg_Parse:
+			if (cf_log_queries) {
+				const char *log_ps_name, *log_ps_query;
+				pkt_rewind_v3(pkt);
+				if (mbuf_get_string(&pkt->data, &log_ps_name) &&
+				    mbuf_get_string(&pkt->data, &log_ps_query)) {
+					char *sanitized = sanitize_sql_query_alloc(log_ps_query);
+					if (sanitized) {
+						slog_info(client, "logging_client_query: prepared_statement=%s query=%s",
+							  log_ps_name, sanitized);
+						free(sanitized);
+					}
+				}
+				pkt_rewind_v3(pkt);
+			}
 			return handle_parse_command(client, pkt);
 		case PqMsg_Bind:
 			return handle_bind_command(client, pkt);
@@ -1646,6 +1663,23 @@ static bool handle_client_work(PgSocket *client, PktHdr *pkt)
 	      slog_noise(client, "logging_client_query: failed to sanitize query");
 	    } else {
 	      slog_info(client, "logging_client_query: query=%s", sanitized_query);
+	    }
+	    free(sanitized_query);
+	  }
+	}
+	if (log_parse == true) {
+	  const char *ps_name_str;
+	  pkt_rewind_v3(pkt);
+	  if (!mbuf_get_string(&pkt->data, &ps_name_str) ||
+	      !mbuf_get_string(&pkt->data, &query)) {
+	    slog_noise(client, "logging_client_query: failed to extract prepared statement query");
+	  } else {
+	    char *sanitized_query = sanitize_sql_query_alloc(query);
+	    if (!sanitized_query) {
+	      slog_noise(client, "logging_client_query: failed to sanitize query");
+	    } else {
+	      slog_info(client, "logging_client_query: prepared_statement=%s query=%s",
+		        ps_name_str, sanitized_query);
 	    }
 	    free(sanitized_query);
 	  }
