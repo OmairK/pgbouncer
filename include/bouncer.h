@@ -189,12 +189,15 @@ extern int cf_sbuf_len;
 
 /*
  * Per-client query-text tracking for log_queries. Maps a Parse statement name
- * (including "" for anonymous) to the SQL text that was prepared, so a Bind
- * packet can be logged with both the query and parameter values.
+ * (including "" for anonymous) to the SQL text and parameter type OIDs that
+ * were prepared, so a Bind packet can be logged with both the query and
+ * decoded parameter values.
  */
 typedef struct LoggedPreparedQuery {
 	UT_hash_handle hh;
 	char *query;
+	uint16_t num_param_types;
+	uint32_t *param_type_oids;
 	char stmt_name[];
 } LoggedPreparedQuery;
 

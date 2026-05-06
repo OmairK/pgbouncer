@@ -1390,52 +1390,73 @@ char *sanitize_sql_query_alloc(const char *input) {
 }
 
 /*
- * Capture the (statement_name, query) mapping from a Parse packet into the
- * client's logged_prepared_queries hash, so a later Bind can log the query
- * text alongside parameter values. Tracks anonymous statements (empty name)
- * too. Idempotent: re-parsing the same name replaces the stored query.
+ * Capture the (statement_name, query, parameter_type_oids) mapping from a
+ * Parse packet into the client's logged_prepared_queries hash, so a later
+ * Bind can log the query text alongside decoded parameter values. Tracks
+ * anonymous statements (empty name) too. Idempotent: re-parsing the same
+ * name replaces the stored entry.
  */
 static void track_parse_query(PgSocket *client, PktHdr *pkt)
 {
 	const char *stmt_name;
 	const char *query;
+	uint16_t num_param_types = 0;
+	uint32_t *param_type_oids = NULL;
 	LoggedPreparedQuery *entry;
-	char *query_copy;
+	char *query_copy = NULL;
 	size_t name_len;
+	uint16_t i;
 
 	pkt_rewind_v3(pkt);
 
 	if (!mbuf_get_string(&pkt->data, &stmt_name) ||
-	    !mbuf_get_string(&pkt->data, &query)) {
-		pkt_rewind_v3(pkt);
-		return;
+	    !mbuf_get_string(&pkt->data, &query) ||
+	    !mbuf_get_uint16be(&pkt->data, &num_param_types))
+		goto out;
+
+	if (num_param_types > 0) {
+		param_type_oids = malloc((size_t) num_param_types * sizeof(uint32_t));
+		if (!param_type_oids)
+			goto out;
+		for (i = 0; i < num_param_types; i++) {
+			if (!mbuf_get_uint32be(&pkt->data, &param_type_oids[i])) {
+				free(param_type_oids);
+				param_type_oids = NULL;
+				goto out;
+			}
+		}
 	}
 
 	query_copy = strdup(query);
 	if (!query_copy) {
-		pkt_rewind_v3(pkt);
-		return;
+		free(param_type_oids);
+		goto out;
 	}
 
 	HASH_FIND_STR(client->logged_prepared_queries, stmt_name, entry);
 	if (entry) {
 		free(entry->query);
+		free(entry->param_type_oids);
 		entry->query = query_copy;
-		pkt_rewind_v3(pkt);
-		return;
+		entry->num_param_types = num_param_types;
+		entry->param_type_oids = param_type_oids;
+		goto out;
 	}
 
 	name_len = strlen(stmt_name) + 1;
 	entry = malloc(sizeof(LoggedPreparedQuery) + name_len);
 	if (!entry) {
 		free(query_copy);
-		pkt_rewind_v3(pkt);
-		return;
+		free(param_type_oids);
+		goto out;
 	}
 	memcpy(entry->stmt_name, stmt_name, name_len);
 	entry->query = query_copy;
+	entry->num_param_types = num_param_types;
+	entry->param_type_oids = param_type_oids;
 	HASH_ADD_STR(client->logged_prepared_queries, stmt_name, entry);
 
+out:
 	pkt_rewind_v3(pkt);
 }
 
@@ -1447,19 +1468,123 @@ void free_logged_prepared_queries(PgSocket *client)
 	HASH_ITER(hh, client->logged_prepared_queries, entry, tmp) {
 		HASH_DEL(client->logged_prepared_queries, entry);
 		free(entry->query);
+		free(entry->param_type_oids);
 		free(entry);
 	}
 	client->logged_prepared_queries = NULL;
 }
 
 /*
+ * Format a binary-format parameter value into the output buffer using the
+ * parameter's type OID. Falls back to "\xHEX" for unknown types or wrong
+ * lengths. Type OIDs are PostgreSQL's well-known pg_type values.
+ */
+static void format_binary_param(PktBuf *out, const uint8_t *data, int32_t plen, uint32_t type_oid)
+{
+	int j;
+	char buf[64];
+	int n;
+
+	switch (type_oid) {
+	case 16:                        /* bool */
+		if (plen == 1) {
+			if (data[0])
+				pktbuf_put_bytes(out, "true", 4);
+			else
+				pktbuf_put_bytes(out, "false", 5);
+			return;
+		}
+		break;
+	case 21:                        /* int2 */
+		if (plen == 2) {
+			int16_t val = (int16_t)(((uint16_t)data[0] << 8) | data[1]);
+			n = snprintf(buf, sizeof(buf), "%d", (int) val);
+			pktbuf_put_bytes(out, buf, n);
+			return;
+		}
+		break;
+	case 23:                        /* int4 */
+		if (plen == 4) {
+			uint32_t u = ((uint32_t)data[0] << 24) | ((uint32_t)data[1] << 16) |
+				     ((uint32_t)data[2] << 8) | (uint32_t)data[3];
+			n = snprintf(buf, sizeof(buf), "%" PRId32, (int32_t) u);
+			pktbuf_put_bytes(out, buf, n);
+			return;
+		}
+		break;
+	case 20:                        /* int8 */
+		if (plen == 8) {
+			uint64_t u = 0;
+			for (j = 0; j < 8; j++)
+				u = (u << 8) | data[j];
+			n = snprintf(buf, sizeof(buf), "%" PRId64, (int64_t) u);
+			pktbuf_put_bytes(out, buf, n);
+			return;
+		}
+		break;
+	case 700:                       /* float4 */
+		if (plen == 4) {
+			uint32_t bits = ((uint32_t)data[0] << 24) | ((uint32_t)data[1] << 16) |
+					((uint32_t)data[2] << 8) | (uint32_t)data[3];
+			float val;
+			memcpy(&val, &bits, sizeof(val));
+			n = snprintf(buf, sizeof(buf), "%g", (double) val);
+			pktbuf_put_bytes(out, buf, n);
+			return;
+		}
+		break;
+	case 701:                       /* float8 */
+		if (plen == 8) {
+			uint64_t bits = 0;
+			double val;
+			for (j = 0; j < 8; j++)
+				bits = (bits << 8) | data[j];
+			memcpy(&val, &bits, sizeof(val));
+			n = snprintf(buf, sizeof(buf), "%g", val);
+			pktbuf_put_bytes(out, buf, n);
+			return;
+		}
+		break;
+	case 19:                        /* name */
+	case 25:                        /* text */
+	case 1042:                      /* bpchar */
+	case 1043:                      /* varchar */
+		pktbuf_put_bytes(out, "'", 1);
+		for (j = 0; j < plen; j++) {
+			char c = (char) data[j];
+			if (c == '\'') {
+				pktbuf_put_bytes(out, "''", 2);
+			} else if (c == '\n') {
+				pktbuf_put_bytes(out, "\\n", 2);
+			} else if (c == '\t') {
+				pktbuf_put_bytes(out, "\\t", 2);
+			} else if (c == '\r') {
+				pktbuf_put_bytes(out, "\\r", 2);
+			} else {
+				pktbuf_put_bytes(out, &c, 1);
+			}
+		}
+		pktbuf_put_bytes(out, "'", 1);
+		return;
+	}
+
+	pktbuf_put_bytes(out, "\\x", 2);
+	for (j = 0; j < plen; j++) {
+		char hex[3];
+		snprintf(hex, sizeof(hex), "%02x", data[j]);
+		pktbuf_put_bytes(out, hex, 2);
+	}
+}
+
+/*
  * Walk a Bind packet's parameter values and emit one log line of the form
- * "prepared_statement=NAME query=SQL params=[v1, v2, ...]". Query text is
- * looked up from logged_prepared_queries (tracked at Parse time); if not
- * found, only params are logged. Text-format params are single-quoted with
- * simple escaping; binary-format params are printed as "\xHEX". NULL params
- * are printed as NULL. Best-effort: bails out quietly if the packet body
- * isn't fully buffered.
+ * "prepared_statement=NAME query=SQL params=[v1, v2, ...]". Query text and
+ * parameter type OIDs are looked up from logged_prepared_queries (tracked at
+ * Parse time); if not found, only params are logged. Text-format params are
+ * single-quoted with simple escaping; binary-format params are decoded using
+ * the type OID (int*, float*, bool, text variants), falling back to "\xHEX"
+ * for unknown types. NULL params are printed as NULL. Best-effort: bails out
+ * quietly if the packet body isn't fully buffered.
  */
 static void log_bind_params(PgSocket *client, PktHdr *pkt)
 {
@@ -1508,6 +1633,7 @@ static void log_bind_params(PgSocket *client, PktHdr *pkt)
 		uint32_t plen_u;
 		int32_t plen;
 		uint16_t format = 0;
+		uint32_t type_oid = 0;
 		const uint8_t *data;
 		int j;
 
@@ -1522,6 +1648,9 @@ static void log_bind_params(PgSocket *client, PktHdr *pkt)
 			format = format_codes[0];
 		else if (num_format_codes > 1 && num_format_codes == num_params)
 			format = format_codes[i];
+
+		if (entry && i < entry->num_param_types)
+			type_oid = entry->param_type_oids[i];
 
 		if (plen < 0) {
 			pktbuf_put_bytes(out, "NULL", 4);
@@ -1549,12 +1678,7 @@ static void log_bind_params(PgSocket *client, PktHdr *pkt)
 			}
 			pktbuf_put_bytes(out, "'", 1);
 		} else {
-			pktbuf_put_bytes(out, "\\x", 2);
-			for (j = 0; j < plen; j++) {
-				char hex[3];
-				snprintf(hex, sizeof(hex), "%02x", data[j]);
-				pktbuf_put_bytes(out, hex, 2);
-			}
+			format_binary_param(out, data, plen, type_oid);
 		}
 	}
 	pktbuf_put_bytes(out, "]", 1);
