@@ -190,6 +190,7 @@ void init_caches(void)
 static void client_free(PgSocket *client)
 {
 	free_client_prepared_statements(client);
+	free_logged_prepared_queries(client);
 	varcache_clean(&client->vars);
 	slab_free(var_list_cache, client->vars.var_list);
 	slab_free(client_cache, client);

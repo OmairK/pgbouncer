@@ -187,6 +187,17 @@ extern int cf_sbuf_len;
 #include "pam.h"
 #include "prepare.h"
 
+/*
+ * Per-client query-text tracking for log_queries. Maps a Parse statement name
+ * (including "" for anonymous) to the SQL text that was prepared, so a Bind
+ * packet can be logged with both the query and parameter values.
+ */
+typedef struct LoggedPreparedQuery {
+	UT_hash_handle hh;
+	char *query;
+	char stmt_name[];
+} LoggedPreparedQuery;
+
 #ifndef WIN32
 #define DEFAULT_UNIX_SOCKET_DIR "/tmp"
 #else
@@ -718,6 +729,8 @@ struct PgSocket {
 
 	/* client: prepared statements prepared by this client */
 	PgClientPreparedStatement *client_prepared_statements;
+	/* client: query-text tracking for log_queries logging */
+	LoggedPreparedQuery *logged_prepared_queries;
 	/* server: prepared statements prepared on this server */
 	PgServerPreparedStatement *server_prepared_statements;
 

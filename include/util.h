@@ -72,3 +72,5 @@ bool cf_set_authdb(struct CfValue *cv, const char *value);
 bool check_reserved_database(const char *value);
 
 char *sanitize_sql_query_alloc(const char *input);
+
+void free_logged_prepared_queries(PgSocket *client);

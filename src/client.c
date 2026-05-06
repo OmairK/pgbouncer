@@ -1390,14 +1390,76 @@ char *sanitize_sql_query_alloc(const char *input) {
 }
 
 /*
+ * Capture the (statement_name, query) mapping from a Parse packet into the
+ * client's logged_prepared_queries hash, so a later Bind can log the query
+ * text alongside parameter values. Tracks anonymous statements (empty name)
+ * too. Idempotent: re-parsing the same name replaces the stored query.
+ */
+static void track_parse_query(PgSocket *client, PktHdr *pkt)
+{
+	const char *stmt_name;
+	const char *query;
+	LoggedPreparedQuery *entry;
+	char *query_copy;
+	size_t name_len;
+
+	pkt_rewind_v3(pkt);
+
+	if (!mbuf_get_string(&pkt->data, &stmt_name) ||
+	    !mbuf_get_string(&pkt->data, &query)) {
+		pkt_rewind_v3(pkt);
+		return;
+	}
+
+	query_copy = strdup(query);
+	if (!query_copy) {
+		pkt_rewind_v3(pkt);
+		return;
+	}
+
+	HASH_FIND_STR(client->logged_prepared_queries, stmt_name, entry);
+	if (entry) {
+		free(entry->query);
+		entry->query = query_copy;
+		pkt_rewind_v3(pkt);
+		return;
+	}
+
+	name_len = strlen(stmt_name) + 1;
+	entry = malloc(sizeof(LoggedPreparedQuery) + name_len);
+	if (!entry) {
+		free(query_copy);
+		pkt_rewind_v3(pkt);
+		return;
+	}
+	memcpy(entry->stmt_name, stmt_name, name_len);
+	entry->query = query_copy;
+	HASH_ADD_STR(client->logged_prepared_queries, stmt_name, entry);
+
+	pkt_rewind_v3(pkt);
+}
+
+/* Free all logged_prepared_queries entries on the given client. */
+void free_logged_prepared_queries(PgSocket *client)
+{
+	LoggedPreparedQuery *entry, *tmp;
+
+	HASH_ITER(hh, client->logged_prepared_queries, entry, tmp) {
+		HASH_DEL(client->logged_prepared_queries, entry);
+		free(entry->query);
+		free(entry);
+	}
+	client->logged_prepared_queries = NULL;
+}
+
+/*
  * Walk a Bind packet's parameter values and emit one log line of the form
  * "prepared_statement=NAME query=SQL params=[v1, v2, ...]". Query text is
- * looked up from pgbouncer's prepared-statement tracking; if not found
- * (anonymous statement, or prepared_statements disabled), only params are
- * logged. Text-format params are single-quoted with simple escaping;
- * binary-format params are printed as "\xHEX". NULL params are printed as
- * NULL. Best-effort: bails out quietly if the packet body isn't fully
- * buffered.
+ * looked up from logged_prepared_queries (tracked at Parse time); if not
+ * found, only params are logged. Text-format params are single-quoted with
+ * simple escaping; binary-format params are printed as "\xHEX". NULL params
+ * are printed as NULL. Best-effort: bails out quietly if the packet body
+ * isn't fully buffered.
  */
 static void log_bind_params(PgSocket *client, PktHdr *pkt)
 {
@@ -1407,7 +1469,7 @@ static void log_bind_params(PgSocket *client, PktHdr *pkt)
 	uint16_t num_format_codes = 0;
 	uint16_t num_params = 0;
 	uint16_t *format_codes = NULL;
-	PgClientPreparedStatement *client_ps = NULL;
+	LoggedPreparedQuery *entry = NULL;
 	PktBuf *out = NULL;
 	uint16_t i;
 
@@ -1433,9 +1495,9 @@ static void log_bind_params(PgSocket *client, PktHdr *pkt)
 	if (!mbuf_get_uint16be(&pkt->data, &num_params))
 		goto fail;
 
-	HASH_FIND_STR(client->client_prepared_statements, statement, client_ps);
-	if (client_ps && client_ps->ps)
-		query_text = client_ps->ps->query_and_parameters;
+	HASH_FIND_STR(client->logged_prepared_queries, statement, entry);
+	if (entry)
+		query_text = entry->query;
 
 	out = pktbuf_dynamic(256);
 	if (!out)
@@ -1580,6 +1642,8 @@ static bool handle_client_work(PgSocket *client, PktHdr *pkt)
 			ps_action = inspect_parse_packet(client, pkt);
 			pkt_rewind_v3(pkt);
 		}
+		if (cf_log_queries)
+			track_parse_query(client, pkt);
 		break;
 
 	case PqMsg_Execute:
