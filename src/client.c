@@ -1389,6 +1389,146 @@ char *sanitize_sql_query_alloc(const char *input) {
     return output;
 }
 
+/*
+ * Walk a Bind packet's parameter values and emit one log line of the form
+ * "prepared_statement=NAME query=SQL params=[v1, v2, ...]". Query text is
+ * looked up from pgbouncer's prepared-statement tracking; if not found
+ * (anonymous statement, or prepared_statements disabled), only params are
+ * logged. Text-format params are single-quoted with simple escaping;
+ * binary-format params are printed as "\xHEX". NULL params are printed as
+ * NULL. Best-effort: bails out quietly if the packet body isn't fully
+ * buffered.
+ */
+static void log_bind_params(PgSocket *client, PktHdr *pkt)
+{
+	const char *portal;
+	const char *statement;
+	const char *query_text = NULL;
+	uint16_t num_format_codes = 0;
+	uint16_t num_params = 0;
+	uint16_t *format_codes = NULL;
+	PgClientPreparedStatement *client_ps = NULL;
+	PktBuf *out = NULL;
+	uint16_t i;
+
+	pkt_rewind_v3(pkt);
+
+	if (!mbuf_get_string(&pkt->data, &portal))
+		goto fail;
+	if (!mbuf_get_string(&pkt->data, &statement))
+		goto fail;
+	if (!mbuf_get_uint16be(&pkt->data, &num_format_codes))
+		goto fail;
+
+	if (num_format_codes > 0) {
+		format_codes = malloc((size_t) num_format_codes * sizeof(uint16_t));
+		if (!format_codes)
+			goto fail;
+		for (i = 0; i < num_format_codes; i++) {
+			if (!mbuf_get_uint16be(&pkt->data, &format_codes[i]))
+				goto fail;
+		}
+	}
+
+	if (!mbuf_get_uint16be(&pkt->data, &num_params))
+		goto fail;
+
+	HASH_FIND_STR(client->client_prepared_statements, statement, client_ps);
+	if (client_ps && client_ps->ps)
+		query_text = client_ps->ps->query_and_parameters;
+
+	out = pktbuf_dynamic(256);
+	if (!out)
+		goto fail;
+
+	pktbuf_put_bytes(out, "[", 1);
+	for (i = 0; i < num_params; i++) {
+		uint32_t plen_u;
+		int32_t plen;
+		uint16_t format = 0;
+		const uint8_t *data;
+		int j;
+
+		if (i > 0)
+			pktbuf_put_bytes(out, ", ", 2);
+
+		if (!mbuf_get_uint32be(&pkt->data, &plen_u))
+			goto fail;
+		plen = (int32_t) plen_u;
+
+		if (num_format_codes == 1)
+			format = format_codes[0];
+		else if (num_format_codes > 1 && num_format_codes == num_params)
+			format = format_codes[i];
+
+		if (plen < 0) {
+			pktbuf_put_bytes(out, "NULL", 4);
+			continue;
+		}
+
+		if (!mbuf_get_bytes(&pkt->data, plen, &data))
+			goto fail;
+
+		if (format == 0) {
+			pktbuf_put_bytes(out, "'", 1);
+			for (j = 0; j < plen; j++) {
+				char c = (char) data[j];
+				if (c == '\'') {
+					pktbuf_put_bytes(out, "''", 2);
+				} else if (c == '\n') {
+					pktbuf_put_bytes(out, "\\n", 2);
+				} else if (c == '\t') {
+					pktbuf_put_bytes(out, "\\t", 2);
+				} else if (c == '\r') {
+					pktbuf_put_bytes(out, "\\r", 2);
+				} else {
+					pktbuf_put_bytes(out, &c, 1);
+				}
+			}
+			pktbuf_put_bytes(out, "'", 1);
+		} else {
+			pktbuf_put_bytes(out, "\\x", 2);
+			for (j = 0; j < plen; j++) {
+				char hex[3];
+				snprintf(hex, sizeof(hex), "%02x", data[j]);
+				pktbuf_put_bytes(out, hex, 2);
+			}
+		}
+	}
+	pktbuf_put_bytes(out, "]", 1);
+
+	if (!out->failed) {
+		char zero = '\0';
+		pktbuf_put_bytes(out, &zero, 1);
+		if (query_text) {
+			char *sanitized = sanitize_sql_query_alloc(query_text);
+			if (sanitized) {
+				slog_info(client, "logging_client_query: prepared_statement=%s query=%s params=%s",
+					  statement, sanitized, (const char *) out->buf);
+				free(sanitized);
+			} else {
+				slog_info(client, "logging_client_query: prepared_statement=%s params=%s",
+					  statement, (const char *) out->buf);
+			}
+		} else {
+			slog_info(client, "logging_client_query: prepared_statement=%s params=%s",
+				  statement, (const char *) out->buf);
+		}
+	}
+
+	free(format_codes);
+	pktbuf_free(out);
+	pkt_rewind_v3(pkt);
+	return;
+
+fail:
+	slog_noise(client, "logging_client_query: failed to extract bind parameters");
+	free(format_codes);
+	if (out)
+		pktbuf_free(out);
+	pkt_rewind_v3(pkt);
+}
+
 /* decide on packets of logged-in client */
 static bool handle_client_work(PgSocket *client, PktHdr *pkt)
 {
@@ -1397,7 +1537,7 @@ static bool handle_client_work(PgSocket *client, PktHdr *pkt)
 	PreparedStatementAction ps_action = PS_IGNORE;
 	PgClosePacket close_packet;
 	int log_query = false;
-	int log_parse = false;
+	int log_bind = false;
 	const char *query;
 
 	switch (pkt->type) {
@@ -1440,8 +1580,6 @@ static bool handle_client_work(PgSocket *client, PktHdr *pkt)
 			ps_action = inspect_parse_packet(client, pkt);
 			pkt_rewind_v3(pkt);
 		}
-		if (cf_log_queries)
-			log_parse = true;
 		break;
 
 	case PqMsg_Execute:
@@ -1462,6 +1600,8 @@ static bool handle_client_work(PgSocket *client, PktHdr *pkt)
 			ps_action = inspect_bind_packet(client, pkt);
 			pkt_rewind_v3(pkt);
 		}
+		if (cf_log_queries)
+			log_bind = true;
 		break;
 
 	case PqMsg_Describe:
@@ -1600,22 +1740,10 @@ static bool handle_client_work(PgSocket *client, PktHdr *pkt)
 		switch (pkt->type)
 		{
 		case PqMsg_Parse:
-			if (cf_log_queries) {
-				const char *log_ps_name, *log_ps_query;
-				pkt_rewind_v3(pkt);
-				if (mbuf_get_string(&pkt->data, &log_ps_name) &&
-				    mbuf_get_string(&pkt->data, &log_ps_query)) {
-					char *sanitized = sanitize_sql_query_alloc(log_ps_query);
-					if (sanitized) {
-						slog_info(client, "logging_client_query: prepared_statement=%s query=%s",
-							  log_ps_name, sanitized);
-						free(sanitized);
-					}
-				}
-				pkt_rewind_v3(pkt);
-			}
 			return handle_parse_command(client, pkt);
 		case PqMsg_Bind:
+			if (cf_log_queries)
+				log_bind_params(client, pkt);
 			return handle_bind_command(client, pkt);
 		case PqMsg_Describe:
 			return handle_describe_command(client, pkt);
@@ -1667,23 +1795,8 @@ static bool handle_client_work(PgSocket *client, PktHdr *pkt)
 	    free(sanitized_query);
 	  }
 	}
-	if (log_parse == true) {
-	  const char *ps_name_str;
-	  pkt_rewind_v3(pkt);
-	  if (!mbuf_get_string(&pkt->data, &ps_name_str) ||
-	      !mbuf_get_string(&pkt->data, &query)) {
-	    slog_noise(client, "logging_client_query: failed to extract prepared statement query");
-	  } else {
-	    char *sanitized_query = sanitize_sql_query_alloc(query);
-	    if (!sanitized_query) {
-	      slog_noise(client, "logging_client_query: failed to sanitize query");
-	    } else {
-	      slog_info(client, "logging_client_query: prepared_statement=%s query=%s",
-		        ps_name_str, sanitized_query);
-	    }
-	    free(sanitized_query);
-	  }
-	}
+	if (log_bind == true)
+		log_bind_params(client, pkt);
 	sbuf_prepare_send(sbuf, &client->link->sbuf, pkt->len);
 
 	return true;
